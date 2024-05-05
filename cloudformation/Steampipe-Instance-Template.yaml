@@ -1,0 +1,234 @@
+
+AWSTemplateFormatVersion: '2010-09-09'
+Description: Deploy an EC2 Instance with Steampipe, leveraging an existing cross account role
+# TemplateSource: https://github.com/jchrisfarris/steampipe_queries/blob/main/Steampipe-Instance-Template.yaml
+
+Parameters:
+
+  pVpcId:
+    Description: VPCId to deploy the Splunk Server Into
+    Type: AWS::EC2::VPC::Id
+
+  pSubNetID:
+    Description: Subnet to place the Instance in
+    Type: AWS::EC2::Subnet::Id
+
+  pAllowedCIDR:
+    Description: Allow this CIDR range for SSH
+    Type: String
+
+  pHostedZoneId:
+    Description: Hosted Zone ID to create DNS Record into
+    Type: String
+    Default: NONE
+
+  pFQDN:
+    Description: Fully Qualified Domain Name for this host (gets registered in Route53)
+    Type: String
+    Default: NONE
+
+  pInstanceType:
+    Description: Size of the Instance
+    Type: String
+    # AllowedValues: [t2.micro, t3a.nano, t3a.micro, t3a.small, t3a.medium, t3a.xlarge, t3.xlarge, m5a.large]
+    Default: t4g.micro
+
+  pKeyName:
+    Description: KeyName for instances
+    Type: AWS::EC2::KeyPair::KeyName
+
+  pVolumeSizeInGB:
+    Description: Size of the root volume to create
+    Type: String
+    Default: 10
+
+  pSteampipeBinaryURL:
+    Description: URL to the Latest Steampipe Binary in GH.
+    Type: String
+
+  pRoleSessionName:
+    Description: Role Session Name to configure Steampipe to use when assuming Roles
+    Type: String
+    Default: steampipe
+
+  pCrossAccountRoleName:
+    Description: The _name_ of the cross account role that can be assumed from this account to all other accounts in the organization.
+    Type: String
+
+
+
+Conditions:
+  cCreateDNSRecord: !And
+    - !Not [ !Equals [ !Ref pHostedZoneId, "NONE" ]]
+    - !Not [ !Equals [ !Ref pFQDN, "NONE" ]]
+
+Resources:
+
+  Instance:
+    Type: AWS::EC2::Instance
+    CreationPolicy:
+      ResourceSignal:
+        Timeout: PT15M
+    Properties:
+      KeyName: !Ref 'pKeyName'
+      DisableApiTermination: 'false'
+      ImageId: 'resolve:ssm:/aws/service/ami-amazon-linux-latest/al2023-ami-kernel-6.1-arm64'
+      InstanceType: !Ref 'pInstanceType'
+      PropagateTagsToVolumeOnCreation: true
+      IamInstanceProfile: !Ref InstanceIamInstanceProfile
+      Monitoring: 'false'
+      SecurityGroupIds:
+        - !Ref SecurityGroup
+      SubnetId: !Ref pSubNetID
+      BlockDeviceMappings:
+        - DeviceName: /dev/xvda
+          Ebs:
+            VolumeSize: !Ref pVolumeSizeInGB
+            VolumeType: gp3
+      Tags:
+      - Key: Name
+        Value: !Ref AWS::StackName
+      UserData:
+        Fn::Base64:
+          Fn::Sub: |
+            #!/bin/bash -xe
+
+            # Install Stuff
+            yum install -y jq git aws-cfn-bootstrap python3-pip amazon-cloudwatch-agent
+
+            # CURL & Install steampipe binary
+            cd /home/ec2-user
+            yum install -y ${pSteampipeBinaryURL}
+
+            # Install Plugin (must run as ec2-user)
+            su ec2-user -c "steampipe plugin install aws"
+
+            # Prep stuff
+            su ec2-user -c "pip install boto3"
+            su ec2-user -c "mkdir /home/ec2-user/.aws"
+
+            # Fetch & Run Config Script
+            curl -s -o generate_config.py https://raw.githubusercontent.com/primeharbor/pht-steampipe/main/scripts/generate_config.py
+            chmod 755 generate_config.py
+            su ec2-user -c "./generate_config.py --rolename ${pCrossAccountRoleName} --role-session-name ${pRoleSessionName} --credential-source Ec2InstanceMetadata"
+
+            # Make sure everything is owned by ec2-user
+            chown -R ec2-user /home/ec2-user
+
+            # Init
+            cat <<EOF> /etc/systemd/system/steampipe.service
+            [Unit]
+            Description=Steampipe
+            After=network.target
+
+            [Service]
+            Environment=STEAMPIPE_INSTALL_DIR=/home/ec2-user/.steampipe STEAMPIPE_LOG_LEVEL=INFO
+            Type=forking
+            Restart=no
+            # RestartSec=5
+            User=ec2-user
+            # ExecStartPre=
+            ExecStart=/usr/bin/steampipe service start
+            # ExecStartPost
+            ExecStop=/usr/bin/steampipe service stop
+            # ExecReload=
+
+            [Install]
+            WantedBy=multi-user.target
+            EOF
+
+            # Enable & start Steampipe
+            systemctl daemon-reload
+            systemctl enable steampipe
+            systemctl start steampipe
+
+            # Tell Cloudformation service it was all good
+            # /opt/aws/bin/cfn-signal -e $? --stack ${AWS::StackName} --resource Instance --region ${AWS::Region}
+            /opt/aws/bin/cfn-signal -e 0 --stack ${AWS::StackName} --resource Instance --region ${AWS::Region}
+
+  InstanceIamInstanceProfile:
+    Type: AWS::IAM::InstanceProfile
+    Properties:
+      Path: /
+      Roles: [!Ref 'InstanceProfileRole']
+
+  InstanceProfileRole:
+    Type: AWS::IAM::Role
+    Properties:
+      RoleName: !Sub ${AWS::StackName}-InstanceProfile
+      AssumeRolePolicyDocument:
+        Version: '2012-10-17'
+        Statement:
+        - Effect: Allow
+          Principal:
+            Service: ec2.amazonaws.com
+          Action:
+            - 'sts:AssumeRole'
+      Path: /
+      ManagedPolicyArns:
+        - arn:aws:iam::aws:policy/service-role/AmazonEC2RoleforSSM
+        - arn:aws:iam::aws:policy/ReadOnlyAccess
+      Policies:
+      - PolicyName: AllowCloudWatchLogs
+        PolicyDocument:
+          Version: '2012-10-17'
+          Statement:
+          - Effect: Allow
+            Action:
+              - logs:CreateLogGroup
+              - logs:CreateLogStream
+              - logs:PutLogEvents
+              - logs:DescribeLogStreams
+            Resource:
+              - 'arn:aws:logs:*:*:*'
+      - PolicyName: AssumeRole
+        PolicyDocument:
+          Version: '2012-10-17'
+          Statement:
+          - Effect: Allow
+            Action:
+              - sts:AssumeRole
+            Resource:
+              - !Sub 'arn:aws:iam::*:role/${pCrossAccountRoleName}'
+
+  PublicRecordSet:
+    Type: AWS::Route53::RecordSet
+    Condition: cCreateDNSRecord
+    Properties:
+      HostedZoneId: !Ref pHostedZoneId
+      Name: !Ref pFQDN
+      ResourceRecords:
+        - !GetAtt Instance.PublicIp
+      TTL: 60
+      Type: A
+
+  SecurityGroup:
+    Type: AWS::EC2::SecurityGroup
+    Properties:
+      VpcId: !Ref pVpcId
+      GroupDescription: "Permits access to Steampipe"
+      GroupName: !Sub "${AWS::StackName}-SecurityGroup"
+      SecurityGroupIngress:
+        - IpProtocol: -1
+          CidrIp: !Ref pAllowedCIDR
+          Description: Allow Everything from allowed CIDR
+        - IpProtocol: tcp
+          FromPort: 22
+          ToPort: 22
+          CidrIp: "18.206.107.24/29"
+          Description: EC2 Instance Connect
+      Tags:
+        - Key: Name
+          Value: !Sub "${AWS::StackName}-SecurityGroup"
+
+
+Outputs:
+
+  StackName:
+    Value: !Ref 'AWS::StackName'
+
+  InstanceId:
+    Value: !Ref 'Instance'
+
+  InstanceIp:
+    Value: !GetAtt Instance.PublicIp
